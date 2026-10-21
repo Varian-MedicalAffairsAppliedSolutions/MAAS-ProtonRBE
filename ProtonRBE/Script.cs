@@ -56,9 +56,6 @@ namespace VMS.TPS
 
     private bool VerifyLicenseAndExpiration()
     {
-      int a = 0;
-      if (a == 0) return true;
-      
       // Check license acceptance first with version support
       var eulaVerifier = new EulaVerifier(PROJECT_NAME, PROJECT_VERSION, LICENSE_URL);
 
@@ -81,8 +78,7 @@ namespace VMS.TPS
         try
         {
           string assemblyName = Assembly.GetExecutingAssembly().GetName().Name;
-          // TODO: QR Code for this project
-          // qrCode = new BitmapImage(new Uri($"pack://application:,,,/{assemblyName};component/Resources/qrcode.bmp"));
+          qrCode = new BitmapImage(new Uri($"pack://application:,,,/{assemblyName};component/Resources/qrcode.png"));
         }
         catch (Exception ex)
         {

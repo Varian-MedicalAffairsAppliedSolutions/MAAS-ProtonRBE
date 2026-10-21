@@ -183,6 +183,7 @@
   </ItemGroup>
   <ItemGroup>
     <Resource Include="Resources\icon.png" />
+    <Resource Include="Resources\qrcode.png" />
   </ItemGroup>
   <ItemGroup>
     <Folder Include="lib\" />
