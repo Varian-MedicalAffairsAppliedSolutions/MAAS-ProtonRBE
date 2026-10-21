@@ -1,0 +1,101 @@
+name: Build ESAPI Script - v19.0
+
+on:
+  workflow_dispatch:
+    inputs:
+      dateInput:
+        description: 'Expiration Date'
+        required: true
+        default: '12/31/2027'
+
+jobs:
+  build:
+    name: Build ESAPI Script - v19.0
+    runs-on: windows-2022
+    env:
+      GITHUB_WORKSPACE_PACKAGES_PATH: packages\ESAPI.19.0.0.1\lib\net48\
+      PROJECT_NAME: ProtonRBE
+      FLDR_SLN_CSPROJ_NAME: ProtonRBE
+      MAJOR_VERSION: 1
+      MINOR_VERSION: 0
+      PATCH_VERSION: 0
+      BUILD_NUMBER: ${{ github.run_number }}
+      CONFIGURATION: Release
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Navigate to Workspace
+      run: cd $GITHUB_WORKSPACE
+
+    - name: Update Target Framework Version to 4.8
+      uses: Nambers/ReplaceStringInFile@v1.1
+      with:
+        path: .\ProtonRBE\ProtonRBE.csproj
+        oldString: "TargetFrameworkVersion>v[\\d\\.]+<"
+        newString: 'TargetFrameworkVersion>v4.8<'
+
+    - name: Update AssemblyInfo.cs
+      id: update_assembly_info
+      run: |
+        .\.github\workflows\Update-AssemblyInfo.ps1 `
+          -AssemblyInfoFilePath .\${{ env.FLDR_SLN_CSPROJ_NAME }}\Properties\AssemblyInfo.cs `
+          -ExpirationDate "${{ github.event.inputs.dateInput }}" `
+          -MajorVersion ${{ env.MAJOR_VERSION }} `
+          -MinorVersion ${{ env.MINOR_VERSION }} `
+          -PatchVersion ${{ env.PATCH_VERSION }} `
+          -BuildNumber ${{ env.BUILD_NUMBER }}
+
+    - name: Setup NuGet.exe for use with actions
+      uses: NuGet/setup-nuget@v2
+      with:
+        nuget-version: latest
+
+    - name: Download nuget packages
+      run: nuget install .\${{ env.FLDR_SLN_CSPROJ_NAME }}\packages.config -OutputDirectory ${{ env.FLDR_SLN_CSPROJ_NAME }}\packages
+
+    - name: Add VIC GitHub NuGet repository
+      run: nuget source add
+        -Name github `
+        -Source "https://nuget.pkg.github.com/Varian-MedicalAffairsAppliedSolutions/index.json" `
+        -UserName craman96 `
+        -Password ${{ secrets.GITHUB_TOKEN }} `
+        -StorePasswordInClearText
+
+    - name: Download ESAPI package
+      run: nuget install ESAPI -Version 19.0.0.1 -OutputDirectory ${{ env.FLDR_SLN_CSPROJ_NAME }}/packages
+
+    - name: Update hint paths in the csproj file
+      run: |
+        .\.github\workflows\Update-EsapiHintPaths.ps1 `
+        -CsprojFilePath .\${{ env.FLDR_SLN_CSPROJ_NAME }}\ `
+        -CsprojFileName ${{ env.FLDR_SLN_CSPROJ_NAME }}.csproj
+
+    - name: Build Solution
+      run: msbuild.exe .\${{ env.FLDR_SLN_CSPROJ_NAME }}\${{ env.FLDR_SLN_CSPROJ_NAME }}.csproj /nologo /nr:false /p:DeleteExistingFiles=True /p:platform="x64" /p:configuration="Release"
+
+    - name: Zip
+      run: |
+        Compress-Archive `
+          -Path ".\${{ env.FLDR_SLN_CSPROJ_NAME }}\bin\${{ env.CONFIGURATION }}\*" `
+          -DestinationPath "${{ github.workspace }}/${{env.PROJECT_NAME}}${{ steps.update_assembly_info.outputs.RELEASE_FILE_NAME }}-EclipseV190.zip"
+    
+    - name: Create Release
+      uses: softprops/action-gh-release@v2.0.9
+      with:
+        name: ${{env.PROJECT_NAME}}-${{ steps.update_assembly_info.outputs.RELEASE_NAME }}-EclipseV19.0
+        tag_name: ${{env.PROJECT_NAME}}-${{ steps.update_assembly_info.outputs.RELEASE_NAME }}-EclipseV19.0
+        token: ${{ secrets.GITHUB_TOKEN }}
+        draft: false
+        prerelease: false
+        body: |
+          This is an official release of the **`${{ env.PROJECT_NAME }}`** project.
+          Supported Eclipse version: `v19.0`.
+          The generated dll is valid until `${{ github.event.inputs.dateInput }}`.
+        files: ${{ github.workspace }}/${{env.PROJECT_NAME}}${{ steps.update_assembly_info.outputs.RELEASE_FILE_NAME }}-EclipseV190.zip
