@@ -12,7 +12,7 @@ on:
         description: Published ESAPI V19 NuGet version
         required: true
         type: string
-        default: '19.0.0'
+        default: '19.0.0.1'
 
 permissions:
   contents: write
