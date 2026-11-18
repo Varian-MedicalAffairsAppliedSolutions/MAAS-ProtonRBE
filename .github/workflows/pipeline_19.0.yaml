@@ -4,98 +4,289 @@ on:
   workflow_dispatch:
     inputs:
       dateInput:
-        description: 'Expiration Date'
+        description: Expiration date (M/d/yyyy)
         required: true
+        type: string
         default: '12/31/2027'
+      esapiVersion:
+        description: Published ESAPI V19 NuGet version
+        required: true
+        type: string
+        default: '19.0.0.1'
+
+permissions:
+  contents: write
 
 jobs:
   build:
     name: Build ESAPI Script - v19.0
     runs-on: windows-2022
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        shell: pwsh
+
     env:
-      GITHUB_WORKSPACE_PACKAGES_PATH: packages\ESAPI.19.0.0.1\lib\net48\
       PROJECT_NAME: ProtonRBE
-      FLDR_SLN_CSPROJ_NAME: ProtonRBE
-      MAJOR_VERSION: 1
-      MINOR_VERSION: 0
-      PATCH_VERSION: 0
+      PROJECT_ROOT: ${{ github.workspace }}\ProtonRBE
+      CSPROJ_FILE_NAME: ProtonRBE.csproj
+      REFERENCE_PACKAGES_DIR: ${{ github.workspace }}\packages
       BUILD_NUMBER: ${{ github.run_number }}
-      CONFIGURATION: Release
+      EXPIRATION_DATE: ${{ inputs.dateInput }}
+      ESAPI_VERSION: ${{ inputs.esapiVersion }}
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v3
-      with:
-        fetch-depth: 0
+      - name: Validate configuration and locate build tools
+        env:
+          NUGET_GITHUB_TOKEN: ${{ secrets.NUGET_GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:NUGET_GITHUB_TOKEN)) {
+            throw "Missing secret NUGET_GITHUB_TOKEN. Add a classic PAT with read:packages and access to the ESAPI package."
+          }
+          [datetime]::ParseExact(
+            $env:EXPIRATION_DATE, 'M/d/yyyy',
+            [System.Globalization.CultureInfo]::InvariantCulture
+          ) | Out-Null
+          if ($env:ESAPI_VERSION -notmatch '^19\.\d+\.\d+(\.\d+)?$') {
+            throw "ESAPI_VERSION must be a published stable V19 package version."
+          }
 
-    - name: Setup MSBuild
-      uses: microsoft/setup-msbuild@v2
+          Get-Command nuget, gh -ErrorAction Stop | Out-Null
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path -LiteralPath $vswhere)) {
+            throw "vswhere.exe was not found."
+          }
+          $installation = & $vswhere -latest -products '*' `
+            -requires Microsoft.Component.MSBuild -property installationPath
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($installation)) {
+            throw "Could not locate Visual Studio with MSBuild."
+          }
+          $msbuild = Join-Path $installation 'MSBuild\Current\Bin\MSBuild.exe'
+          if (-not (Test-Path -LiteralPath $msbuild)) {
+            throw "MSBuild.exe was not found: $msbuild"
+          }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 `
+            -Value "MSBUILD_PATH=$msbuild"
 
-    - name: Navigate to Workspace
-      run: cd $GITHUB_WORKSPACE
+      - name: Checkout application
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
-    - name: Update Target Framework Version to 4.8
-      uses: Nambers/ReplaceStringInFile@v1.1
-      with:
-        path: .\ProtonRBE\ProtonRBE.csproj
-        oldString: "TargetFrameworkVersion>v[\\d\\.]+<"
-        newString: 'TargetFrameworkVersion>v4.8<'
+      - name: Install .NET Framework 4.8 reference assemblies
+        run: |
+          $ErrorActionPreference = 'Stop'
+          nuget install Microsoft.NETFramework.ReferenceAssemblies.net48 `
+            -Version 1.0.3 -Source 'https://api.nuget.org/v3/index.json' `
+            -OutputDirectory "$env:REFERENCE_PACKAGES_DIR" -NonInteractive
+          if ($LASTEXITCODE -ne 0) {
+            throw ".NET Framework 4.8 reference assemblies installation failed."
+          }
+          $root = Join-Path $env:REFERENCE_PACKAGES_DIR `
+            'Microsoft.NETFramework.ReferenceAssemblies.net48.1.0.3\build'
+          foreach ($file in @('mscorlib.dll', 'Facades\System.Runtime.dll')) {
+            if (-not (Test-Path -LiteralPath "$root\.NETFramework\v4.8\$file")) {
+              throw "Missing .NET Framework 4.8 reference assembly: $file"
+            }
+          }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8 `
+            -Value "NET48_REFERENCE_ROOT=$root"
 
-    - name: Update AssemblyInfo.cs
-      id: update_assembly_info
-      run: |
-        .\.github\workflows\Update-AssemblyInfo.ps1 `
-          -AssemblyInfoFilePath .\${{ env.FLDR_SLN_CSPROJ_NAME }}\Properties\AssemblyInfo.cs `
-          -ExpirationDate "${{ github.event.inputs.dateInput }}" `
-          -MajorVersion ${{ env.MAJOR_VERSION }} `
-          -MinorVersion ${{ env.MINOR_VERSION }} `
-          -PatchVersion ${{ env.PATCH_VERSION }} `
-          -BuildNumber ${{ env.BUILD_NUMBER }}
+      - name: Restore application NuGet packages
+        run: |
+          $ErrorActionPreference = 'Stop'
+          nuget restore "$env:PROJECT_ROOT\packages.config" `
+            -PackagesDirectory "$env:PROJECT_ROOT\packages" `
+            -Source 'https://api.nuget.org/v3/index.json' -NonInteractive
+          if ($LASTEXITCODE -ne 0) {
+            throw "Application NuGet restore failed."
+          }
 
-    - name: Setup NuGet.exe for use with actions
-      uses: NuGet/setup-nuget@v2
-      with:
-        nuget-version: latest
+      - name: Download ESAPI V19
+        env:
+          NUGET_GITHUB_TOKEN: ${{ secrets.NUGET_GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $configPath = Join-Path $env:RUNNER_TEMP 'protonrbe-esapi.nuget.config'
+          @'
+          <configuration>
+            <packageSources>
+              <clear />
+              <add key="VarianESAPI" value="https://nuget.pkg.github.com/Varian-MedicalAffairsAppliedSolutions/index.json" />
+              <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+            </packageSources>
+          </configuration>
+          '@ | Set-Content -LiteralPath $configPath -Encoding utf8
+          $env:NuGetPackageSourceCredentials_VarianESAPI = `
+            "Username=$env:GITHUB_ACTOR;Password=$env:NUGET_GITHUB_TOKEN;ValidAuthenticationTypes=Basic"
 
-    - name: Download nuget packages
-      run: nuget install .\${{ env.FLDR_SLN_CSPROJ_NAME }}\packages.config -OutputDirectory ${{ env.FLDR_SLN_CSPROJ_NAME }}\packages
+          nuget install ESAPI -Version "$env:ESAPI_VERSION" `
+            -ConfigFile $configPath -OutputDirectory "$env:PROJECT_ROOT\packages" `
+            -NonInteractive
+          if ($LASTEXITCODE -ne 0) {
+            throw "ESAPI $env:ESAPI_VERSION download failed. Confirm the version exists and NUGET_GITHUB_TOKEN has package access and any required organization SSO authorization."
+          }
 
-    - name: Add VIC GitHub NuGet repository
-      run: nuget source add
-        -Name github `
-        -Source "https://nuget.pkg.github.com/Varian-MedicalAffairsAppliedSolutions/index.json" `
-        -UserName craman96 `
-        -Password ${{ secrets.GITHUB_TOKEN }} `
-        -StorePasswordInClearText
+      - name: Configure and validate assembly references
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $projectPath = Join-Path $env:PROJECT_ROOT $env:CSPROJ_FILE_NAME
+          $esapiDirectory = Join-Path $env:PROJECT_ROOT `
+            "packages\ESAPI.$env:ESAPI_VERSION\lib\net48"
+          foreach ($file in @('VMS.TPS.Common.Model.API.dll', 'VMS.TPS.Common.Model.Types.dll')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $esapiDirectory $file))) {
+              throw "ESAPI package assembly was not found: $esapiDirectory\$file"
+            }
+          }
 
-    - name: Download ESAPI package
-      run: nuget install ESAPI -Version 19.0.0.1 -OutputDirectory ${{ env.FLDR_SLN_CSPROJ_NAME }}/packages
+          $env:GITHUB_WORKSPACE_PACKAGES_PATH = $esapiDirectory
+          .\.github\workflows\Update-EsapiHintPaths.ps1 `
+            -CsprojFilePath "$env:PROJECT_ROOT" `
+            -CsprojFileName "$env:CSPROJ_FILE_NAME"
 
-    - name: Update hint paths in the csproj file
-      run: |
-        .\.github\workflows\Update-EsapiHintPaths.ps1 `
-        -CsprojFilePath .\${{ env.FLDR_SLN_CSPROJ_NAME }}\ `
-        -CsprojFileName ${{ env.FLDR_SLN_CSPROJ_NAME }}.csproj
+          [xml]$project = Get-Content -LiteralPath $projectPath -Raw
+          $ns = New-Object System.Xml.XmlNamespaceManager($project.NameTable)
+          $ns.AddNamespace('msb', $project.DocumentElement.NamespaceURI)
+          $framework = $project.SelectSingleNode(
+            '/msb:Project/msb:PropertyGroup/msb:TargetFrameworkVersion', $ns
+          )
+          if ($null -eq $framework -or $framework.InnerText -ne 'v4.8') {
+            throw "The ProtonRBE V19 project must target .NET Framework 4.8."
+          }
+          $referenceGroup = $project.SelectSingleNode(
+            '/msb:Project/msb:ItemGroup[msb:Reference]', $ns
+          )
+          if ($null -eq $referenceGroup) {
+            throw "The application project has no assembly reference group."
+          }
 
-    - name: Build Solution
-      run: msbuild.exe .\${{ env.FLDR_SLN_CSPROJ_NAME }}\${{ env.FLDR_SLN_CSPROJ_NAME }}.csproj /nologo /nr:false /p:DeleteExistingFiles=True /p:platform="x64" /p:configuration="Release"
+          $assemblyPaths = @{
+            'System.Runtime' = "$env:NET48_REFERENCE_ROOT\.NETFramework\v4.8\Facades\System.Runtime.dll"
+            'EulaVerification' = "$env:PROJECT_ROOT\lib\EulaVerification.dll"
+          }
+          foreach ($name in $assemblyPaths.Keys) {
+            $path = $assemblyPaths[$name]
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Required assembly was not found: $path"
+            }
+            $existingReferences = @($project.SelectNodes('//msb:Reference', $ns) |
+              Where-Object { ($_.GetAttribute('Include') -split ',')[0] -eq $name })
+            if ($existingReferences.Count -gt 1) {
+              throw "Duplicate assembly reference: $name"
+            }
+            if ($existingReferences.Count -eq 1) {
+              $reference = $existingReferences[0]
+            } else {
+              $reference = $project.CreateElement('Reference', $project.DocumentElement.NamespaceURI)
+              $referenceGroup.AppendChild($reference) | Out-Null
+            }
+            $reference.SetAttribute('Include', $name)
+            $metadata = @{
+              HintPath = $path
+              SpecificVersion = 'False'
+              Private = ($name -eq 'EulaVerification').ToString()
+            }
+            foreach ($key in $metadata.Keys) {
+              $element = $reference.SelectSingleNode("msb:$key", $ns)
+              if ($null -eq $element) {
+                $element = $project.CreateElement($key, $project.DocumentElement.NamespaceURI)
+                $reference.AppendChild($element) | Out-Null
+              }
+              $element.InnerText = $metadata[$key]
+            }
+          }
 
-    - name: Zip
-      run: |
-        Compress-Archive `
-          -Path ".\${{ env.FLDR_SLN_CSPROJ_NAME }}\bin\${{ env.CONFIGURATION }}\*" `
-          -DestinationPath "${{ github.workspace }}/${{env.PROJECT_NAME}}${{ steps.update_assembly_info.outputs.RELEASE_FILE_NAME }}-EclipseV190.zip"
-    
-    - name: Create Release
-      uses: softprops/action-gh-release@v2.0.9
-      with:
-        name: ${{env.PROJECT_NAME}}-${{ steps.update_assembly_info.outputs.RELEASE_NAME }}-EclipseV19.0
-        tag_name: ${{env.PROJECT_NAME}}-${{ steps.update_assembly_info.outputs.RELEASE_NAME }}-EclipseV19.0
-        token: ${{ secrets.GITHUB_TOKEN }}
-        draft: false
-        prerelease: false
-        body: |
-          This is an official release of the **`${{ env.PROJECT_NAME }}`** project.
-          Supported Eclipse version: `v19.0`.
-          The generated dll is valid until `${{ github.event.inputs.dateInput }}`.
-        files: ${{ github.workspace }}/${{env.PROJECT_NAME}}${{ steps.update_assembly_info.outputs.RELEASE_FILE_NAME }}-EclipseV190.zip
+          foreach ($hint in $project.SelectNodes('//msb:Reference/msb:HintPath', $ns)) {
+            $path = $hint.InnerText
+            if (-not [System.IO.Path]::IsPathRooted($path)) {
+              $path = Join-Path $env:PROJECT_ROOT $path
+            }
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Unresolved project HintPath: $path"
+            }
+          }
+          $project.Save($projectPath)
+
+      - name: Update assembly version and expiration
+        id: update_assembly_info
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\.github\workflows\Update-AssemblyInfo.ps1 `
+            -AssemblyInfoFilePath "$env:PROJECT_ROOT\Properties\AssemblyInfo.cs" `
+            -ExpirationDate "$env:EXPIRATION_DATE" `
+            -BuildNumber "$env:BUILD_NUMBER" `
+            -MajorVersion 1 -MinorVersion 0 -PatchVersion 0
+
+      - name: Build application
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & "$env:MSBUILD_PATH" "$env:PROJECT_ROOT\$env:CSPROJ_FILE_NAME" `
+            /nologo /nr:false /p:Configuration=Release /p:Platform=x64 `
+            "/p:OutputPath=$env:PROJECT_ROOT\bin\Release" `
+            "/p:TargetFrameworkRootPath=$env:NET48_REFERENCE_ROOT" `
+            "/p:FrameworkPathOverride=$env:NET48_REFERENCE_ROOT\.NETFramework\v4.8"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Application build failed."
+          }
+
+      - name: Package release
+        id: package
+        env:
+          RELEASE_STEM: ${{ steps.update_assembly_info.outputs.RELEASE_FILE_NAME }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:RELEASE_STEM)) {
+            throw "The assembly update step did not produce a release filename."
+          }
+          $output = Join-Path $env:PROJECT_ROOT 'bin\Release'
+          foreach ($file in @('ProtonRBE.esapi.dll', 'EulaVerification.dll', 'License.txt')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $output $file) -PathType Leaf)) {
+              throw "Required release file is missing: $file"
+            }
+          }
+          $tag = "$env:PROJECT_NAME-$env:RELEASE_STEM-EclipseV19.0"
+          $zip = Join-Path $env:GITHUB_WORKSPACE "$env:PROJECT_NAME$env:RELEASE_STEM-EclipseV190.zip"
+          Compress-Archive -Path "$output\*" -DestinationPath $zip -Force
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8 -Value "tag=$tag"
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8 -Value "zip=$zip"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.package.outputs.tag }}
+          RELEASE_ZIP: ${{ steps.package.outputs.zip }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $notesFile = Join-Path $env:RUNNER_TEMP 'protonrbe-release-notes.txt'
+          @"
+          Build of **$env:PROJECT_NAME** for Eclipse **v19.0**.
+          ESAPI package version: **$env:ESAPI_VERSION**.
+          Expiration date: **$env:EXPIRATION_DATE**.
+          Built on $(Get-Date -Format 'yyyy-MM-dd').
+          "@ | Set-Content -LiteralPath $notesFile -Encoding utf8
+
+          $tags = @(& gh api --paginate `
+            "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" --jq '.[].tag_name')
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not list repository releases."
+          }
+          if ($tags -notcontains $env:RELEASE_TAG) {
+            gh release create "$env:RELEASE_TAG" `
+              --repo "$env:GITHUB_REPOSITORY" --target "$env:GITHUB_SHA" `
+              --title "$env:RELEASE_TAG" --notes-file "$notesFile" --draft
+            if ($LASTEXITCODE -ne 0) {
+              throw "Could not create the draft release."
+            }
+          }
+          gh release upload "$env:RELEASE_TAG" "$env:RELEASE_ZIP" `
+            --repo "$env:GITHUB_REPOSITORY" --clobber
+          if ($LASTEXITCODE -ne 0) {
+            throw "Release asset upload failed."
+          }
+          gh release edit "$env:RELEASE_TAG" --repo "$env:GITHUB_REPOSITORY" `
+            --title "$env:RELEASE_TAG" --notes-file "$notesFile" --draft=false
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not publish the release."
+          }
